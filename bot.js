@@ -481,9 +481,16 @@ async function run() {
   console.log(`\n${"═".repeat(56)}`);
   console.log(`  Alpaca Trading Bot — ${isPaper ? "📋 PAPER" : "🔴 LIVE"}`);
   console.log(`  ${ts}`);
+  console.log(`  Telegram token: ${process.env.TELEGRAM_BOT_TOKEN ? "SET" : "MISSING"}`);
+  console.log(`  Telegram chat:  ${process.env.TELEGRAM_CHAT_ID   ? "SET" : "MISSING"}`);
   console.log(`${"═".repeat(56)}`);
 
-  const log     = loadLog();
+  // Startup ping — confirms bot is alive and Telegram is working
+  const log = loadLog();
+  if (todayTrades(log) === 0) {
+    await notify(`🤖 <b>Alpaca Bot Started</b>\n${isPaper ? "📋 PAPER" : "🔴 LIVE"} | ${ts.slice(0,19).replace("T"," ")} UTC\nPortfolio: $${CONFIG.portfolioUSD} | Risk: ${CONFIG.riskPct}% per trade`);
+  }
+
   const traded  = todayTrades(log);
   if (traded >= CONFIG.maxTradesPerDay) {
     console.log(`🚫 Daily trade limit reached (${traded}/${CONFIG.maxTradesPerDay})`);

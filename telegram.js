@@ -2,14 +2,22 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT  = process.env.TELEGRAM_CHAT_ID   || "";
 
 export async function notify(text) {
-  if (!TOKEN || !CHAT) return;
+  if (!TOKEN || !CHAT) {
+    console.log(`[Telegram] SKIPPED — token: ${TOKEN ? "set" : "MISSING"}, chat: ${CHAT ? "set" : "MISSING"}`);
+    return;
+  }
   try {
-    await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    const res  = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({ chat_id: CHAT, text, parse_mode: "HTML" }),
     });
-  } catch { /* silent */ }
+    const json = await res.json();
+    if (!json.ok) console.log(`[Telegram] ERROR: ${json.description}`);
+    else console.log(`[Telegram] Sent OK`);
+  } catch (err) {
+    console.log(`[Telegram] FAILED: ${err.message}`);
+  }
 }
 
 export function fmtEntry({ symbol, side, price, size, sl, tp, confidence, mode }) {
