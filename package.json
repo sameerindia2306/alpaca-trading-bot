@@ -1,0 +1,16 @@
+{
+  "name": "alpaca-trading-bot",
+  "version": "1.0.0",
+  "description": "Crypto 24/7 + US stocks NYSE hours — Alpaca paper/live trading with Telegram alerts",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
