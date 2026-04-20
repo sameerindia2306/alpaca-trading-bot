@@ -13,7 +13,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import http from "http";
-import { notify, fmtEntry, fmtExit, fmtSummary } from "./telegram.js";
+import { notify, fmtEntry, fmtExit } from "./telegram.js";
 
 http.createServer((_, res) => res.end("OK")).on("error", () => {}).listen(process.env.PORT || 3000);
 
@@ -23,10 +23,11 @@ const CONFIG = {
   key:             process.env.ALPACA_API_KEY    || "",
   secret:          process.env.ALPACA_SECRET_KEY || "",
   baseUrl:         process.env.ALPACA_BASE_URL   || "https://paper-api.alpaca.markets",
-  portfolioUSD:    parseFloat(process.env.PORTFOLIO_VALUE_USD  || "2000"),
-  riskPct:         parseFloat(process.env.RISK_PCT             || "1"),    // % per FULL trade
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY     || "20"),
-  maxOpenPos:      parseInt(process.env.MAX_OPEN_POSITIONS      || "5"),
+  portfolioUSD:    parseFloat(process.env.PORTFOLIO_VALUE_USD  || "100000"),
+  riskPct:         parseFloat(process.env.RISK_PCT             || "10"),   // % per FULL trade
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY     || "100"),
+  maxOpenPos:      parseInt(process.env.MAX_OPEN_POSITIONS      || "20"),
+  cryptoAllocationPct: parseFloat(process.env.CRYPTO_ALLOCATION_PCT || "60"), // % of daily trades for crypto
   stockPool: (process.env.STOCK_POOL ||
     "SPY,QQQ,NVDA,AAPL,TSLA,META,GOOGL,AMD,AMZN,MSFT,NFLX,CRM,DDOG,MSTR"
   ).split(","),
@@ -68,11 +69,36 @@ function parseBars(raw) {
   }));
 }
 
+// Coinbase free API for crypto data (no auth required)
+async function fetchCoinbaseBars(symbol, tf = "5m", limit = 100) {
+  const coinbaseSymbol = symbol.replace("USD", "-USD");
+  const granularity = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400 }[tf] || 300;
+  const end = new Date().toISOString();
+  const res = await fetch(`https://api.exchange.coinbase.com/products/${coinbaseSymbol}/candles?granularity=${granularity}&limit=${limit}`);
+  if (!res.ok) throw new Error(`Coinbase ${symbol}: ${res.status}`);
+  const data = await res.json();
+  // Coinbase returns [time, low, high, open, close, volume] in reverse order (newest first)
+  const candles = data.reverse().map(c => ({
+    time: c[0] * 1000, // seconds to ms
+    open: c[3],
+    high: c[2],
+    low: c[1],
+    close: c[4],
+    volume: c[5],
+  }));
+  return candles;
+}
+
 async function fetchCryptoBars(symbols, tf = "5Min", limit = 100) {
-  const q = `symbols=${encodeURIComponent(symbols.join(","))}&timeframe=${tf}&limit=${limit}`;
-  const d = await alpacaData(`/v1beta3/crypto/us/bars?${q}`);
   const r = {};
-  for (const [s, bars] of Object.entries(d.bars || {})) r[s] = parseBars(bars);
+  for (const sym of symbols) {
+    try {
+      const coinbaseTf = tf.replace("Min", "m").replace("Hour", "h").replace("Day", "d");
+      r[sym] = await fetchCoinbaseBars(sym, coinbaseTf, limit);
+    } catch (e) {
+      console.log(`  Coinbase error ${sym}: ${e.message}`);
+    }
+  }
   return r;
 }
 
@@ -150,11 +176,11 @@ async function getTrendBias(symbol, isCrypto) {
 // ─── Strategy ─────────────────────────────────────────────────────────────────
 
 const PARAMS = {
-  crypto: { emaFast: 9, emaSlow: 21, rsiBullMin: 45, rsiBullMax: 75, rsiBearMin: 25, rsiBearMax: 55, vwapDistMax: 2.5, trendMin: 0.05 },
-  stock:  { emaFast: 9, emaSlow: 21, rsiBullMin: 45, rsiBullMax: 75, rsiBearMin: 25, rsiBearMax: 55, vwapDistMax: 1.5, trendMin: 0.08 },
+  crypto: { emaFast: 9, emaSlow: 21, rsiBullMin: 30, rsiBullMax: 80, rsiBearMin: 20, rsiBearMax: 70, vwapDistMax: 5.0, trendMin: 0.008 },
+  stock:  { emaFast: 9, emaSlow: 21, rsiBullMin: 30, rsiBullMax: 80, rsiBearMin: 20, rsiBearMax: 70, vwapDistMax: 4.0, trendMin: 0.015 },
 };
 
-function runStrategy(candles, trendBias, p) {
+function runStrategy(candles, trendBias, p, isCrypto) {
   const closes   = candles.map(c => c.close);
   const price    = closes[closes.length - 1];
   const emaFast  = calcEMA(closes, p.emaFast);
@@ -166,16 +192,22 @@ function runStrategy(candles, trendBias, p) {
 
   console.log(`  $${price.toFixed(4)} | EMA(${p.emaFast}): $${emaFast.toFixed(4)} | EMA(${p.emaSlow}): $${emaSlow.toFixed(4)} | RSI: ${rsi ? rsi.toFixed(1) : "N/A"} | VWAP: ${vwap ? "$" + vwap.toFixed(4) : "N/A"}`);
 
-  // Critical — both must pass or block
+  // Volatility filter - skip dead markets (ATR < 0.3% for crypto, 0.5% for stocks)
+  const atrPct = atr ? (atr / price) * 100 : 0;
+  const minAtrPct = isCrypto ? 0.3 : 0.5;
+  const volOk = atrPct >= minAtrPct;
+  console.log(`  ${volOk ? "✅" : "🚫"} [C] Volatility ${atrPct.toFixed(2)}% (min ${minAtrPct}%)`);
+  if (!volOk) return { pass: false, score: 0, side: null, price, atr };
+
+  // Critical — EMA direction only (removed strength filter)
   const trendOk = emaFast !== emaSlow;
-  const strengthOk = trendStr >= p.trendMin;
-  console.log(`  ${trendOk ? "✅" : "🚫"} [C] EMA direction | ${strengthOk ? "✅" : "🚫"} [C] Trend strength ${trendStr.toFixed(3)}%`);
-  if (!trendOk || !strengthOk) return { pass: false, score: 0, side: null, price, atr };
+  console.log(`  ${trendOk ? "✅" : "🚫"} [C] EMA direction`);
+  if (!trendOk) return { pass: false, score: 0, side: null, price, atr };
 
   const goLong = emaFast > emaSlow;
   const side   = goLong ? "buy" : "sell";
 
-  // Bonus — each passing adds +1 to confidence
+  // Bonus — each passing adds +1 to confidence (need 2-of-3 minimum)
   let score = 0;
   const rsiBull = rsi !== null && rsi >= p.rsiBullMin && rsi <= p.rsiBullMax;
   const rsiBear = rsi !== null && rsi >= p.rsiBearMin && rsi <= p.rsiBearMax;
@@ -194,6 +226,13 @@ function runStrategy(candles, trendBias, p) {
     const vwapPass = (goLong ? price > vwap : price < vwap) && dist < p.vwapDistMax;
     if (vwapPass) score++;
     console.log(`  ${vwapPass ? "✅" : "⚪"} [B] VWAP aligned (dist ${dist.toFixed(2)}%)`);
+  }
+
+  // Require at least 2-of-3 bonus conditions (or 1-of-3 if no 15m bias available)
+  const minBonus = trendBias ? 2 : 1;
+  if (score < minBonus) {
+    console.log(`  🚫 Need ${minBonus}+ bonus conditions, got ${score}`);
+    return { pass: false, score, side, price, atr };
   }
 
   return { pass: true, score, side, price, atr };
@@ -217,7 +256,9 @@ function confidenceLabel(score) {
 // ─── SL / TP ─────────────────────────────────────────────────────────────────
 
 function calcSLTP(side, price, atr) {
-  const risk = atr * 1.0;
+  // Alpaca requires minimum 0.01 distance for crypto
+  const minDistance = 0.015;
+  const risk = Math.max(atr * 1.5, minDistance);
   return {
     sl: +(side === "buy" ? price - risk : price + risk).toFixed(4),
     tp: +(side === "buy" ? price + risk * 2 : price - risk * 2).toFixed(4),
@@ -257,6 +298,16 @@ function saveLog(l)  { writeFileSync(LOG_FILE, JSON.stringify(l, null, 2)); }
 function todayTrades(log) {
   const today = new Date().toISOString().slice(0, 10);
   return log.trades.filter(t => t.date === today && t.placed).length;
+}
+
+function todayCryptoTrades(log) {
+  const today = new Date().toISOString().slice(0, 10);
+  return log.trades.filter(t => t.date === today && t.placed && t.symbol.includes("USD")).length;
+}
+
+function todayStockTrades(log) {
+  const today = new Date().toISOString().slice(0, 10);
+  return log.trades.filter(t => t.date === today && t.placed && !t.symbol.includes("USD")).length;
 }
 
 // ─── Exit detection ───────────────────────────────────────────────────────────
@@ -318,43 +369,10 @@ const CRYPTO_WL   = "crypto-watchlist.json";
 const STOCK_WL    = "stock-watchlist.json";
 
 async function refreshCryptoWatchlist() {
-  if (existsSync(CRYPTO_WL)) {
-    const wl = JSON.parse(readFileSync(CRYPTO_WL, "utf8"));
-    if (Date.now() - new Date(wl.updatedAt).getTime() < 24 * 3600 * 1000) return wl.symbols;
-  }
-  try {
-    console.log("[CryptoScan] Discovering top crypto pairs from Alpaca...");
-    const assets  = await alpaca("GET", "/v2/assets?asset_class=crypto&status=active&tradable=true");
-    const symbols = assets
-      .map(a => a.symbol.replace("/", ""))
-      .filter(s => s.endsWith("USD") && !STABLECOINS.has(s));
-
-    // Batch fetch 1-day bars in chunks of 10
-    const scores = [];
-    for (let i = 0; i < symbols.length; i += 10) {
-      const chunk = symbols.slice(i, i + 10);
-      try {
-        const bars = await fetchCryptoBars(chunk, "1Day", 10);
-        for (const [sym, candles] of Object.entries(bars)) {
-          if (candles.length < 3) continue;
-          const atr   = calcATR(candles, Math.min(candles.length - 1, 5));
-          const price = candles[candles.length - 1].close;
-          if (atr && price > 0) scores.push({ sym, atrPct: (atr / price) * 100 });
-        }
-      } catch {}
-      await new Promise(r => setTimeout(r, 500));
-    }
-
-    const top = scores.sort((a, b) => b.atrPct - a.atrPct).slice(0, 10).map(s => s.sym);
-    console.log(`[CryptoScan] Top 10: ${top.join(", ")}`);
-    writeFileSync(CRYPTO_WL, JSON.stringify({ symbols: top, updatedAt: new Date().toISOString() }, null, 2));
-    await notify(`🔍 <b>Crypto Watchlist Updated</b>\n${top.join(", ")}`);
-    return top;
-  } catch (err) {
-    console.log(`[CryptoScan] Failed: ${err.message}`);
-    if (existsSync(CRYPTO_WL)) return JSON.parse(readFileSync(CRYPTO_WL, "utf8")).symbols;
-    return ["BTCUSD","ETHUSD","SOLUSD","AVAXUSD","LINKUSD","DOGEUSD","LTCUSD","UNIUSD","BCHUSD","XLMUSD"];
-  }
+  // Alpaca-supported crypto only (free Coinbase data + Alpaca trading)
+  const supportedCrypto = ["BTCUSD","ETHUSD","SOLUSD","AVAXUSD","LINKUSD","DOGEUSD","LTCUSD","UNIUSD","BCHUSD","DOTUSD"];
+  console.log(`[Crypto] Using Alpaca-supported: ${supportedCrypto.join(", ")}`);
+  return supportedCrypto;
 }
 
 async function refreshStockWatchlist() {
@@ -372,10 +390,10 @@ async function refreshStockWatchlist() {
       const price = candles[candles.length - 1].close;
       if (atr && price > 0) scores.push({ sym, atrPct: (atr / price) * 100 });
     }
-    const top = scores.sort((a, b) => b.atrPct - a.atrPct).slice(0, 8).map(s => s.sym);
-    console.log(`[StockScan] Top 8: ${top.join(", ")}`);
+    const top = scores.sort((a, b) => b.atrPct - a.atrPct).slice(0, 12).map(s => s.sym);
+    console.log(`[StockScan] Top 12: ${top.join(", ")}`);
     writeFileSync(STOCK_WL, JSON.stringify({ symbols: top, updatedAt: new Date().toISOString() }, null, 2));
-    await notify(`🔍 <b>Stock Watchlist Updated</b>\n${top.join(", ")}`);
+    // No watchlist notification - trades only
     return top;
   } catch (err) {
     console.log(`[StockScan] Failed: ${err.message}`);
@@ -410,7 +428,7 @@ async function processSymbol(symbol, candles, isCrypto, log) {
 
   const trendBias  = await getTrendBias(symbol, isCrypto);
   const p          = isCrypto ? PARAMS.crypto : PARAMS.stock;
-  const { pass, score, side, price, atr } = runStrategy(candles, trendBias, p);
+  const { pass, score, side, price, atr } = runStrategy(candles, trendBias, p, isCrypto);
 
   if (!pass || !side || !atr) { console.log(`  🚫 BLOCKED`); return; }
 
@@ -458,15 +476,7 @@ async function maybeSendDailySummary(log) {
   let equity;
   try { equity = parseFloat((await alpaca("GET", "/v2/account")).equity); } catch {}
 
-  // Count wins/losses from closed positions (rough from log isn't possible without exit data)
-  await notify(fmtSummary({
-    date:       today,
-    tradeCount: todays.length,
-    winCount:   0,   // updated when exit tracking is enhanced
-    lossCount:  0,
-    pnlUSD:     equity ? equity - CONFIG.portfolioUSD : 0,
-    equity,
-  }));
+  // No daily summary notification - only trade alerts
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
@@ -485,12 +495,8 @@ async function run() {
   console.log(`  Telegram chat:  ${process.env.TELEGRAM_CHAT_ID   ? "SET" : "MISSING"}`);
   console.log(`${"═".repeat(56)}`);
 
-  // Startup ping — confirms bot is alive and Telegram is working
+  // Load trade log
   const log = loadLog();
-  if (todayTrades(log) === 0) {
-    await notify(`🤖 <b>Alpaca Bot Started</b>\n${isPaper ? "📋 PAPER" : "🔴 LIVE"} | ${ts.slice(0,19).replace("T"," ")} UTC\nPortfolio: $${CONFIG.portfolioUSD} | Risk: ${CONFIG.riskPct}% per trade`);
-  }
-
   const traded  = todayTrades(log);
   if (traded >= CONFIG.maxTradesPerDay) {
     console.log(`🚫 Daily trade limit reached (${traded}/${CONFIG.maxTradesPerDay})`);
@@ -516,9 +522,14 @@ async function run() {
     try { stockBars = await fetchStockBars(stockSyms, "5Min", 100); } catch (e) { console.log(`⚠️  Stock bars: ${e.message}`); }
   }
 
-  // Process crypto (always)
+  // Process crypto (always, 24/7)
+  const maxCryptoTrades = Math.round(CONFIG.maxTradesPerDay * CONFIG.cryptoAllocationPct / 100);
+  const cryptoTraded = todayCryptoTrades(log);
   for (const sym of cryptoSyms) {
-    if (todayTrades(log) >= CONFIG.maxTradesPerDay) break;
+    if (cryptoTraded >= maxCryptoTrades) {
+      console.log(`  🚫 Crypto limit reached (${cryptoTraded}/${maxCryptoTrades})`);
+      break;
+    }
     const candles = cryptoBars[sym];
     if (!candles?.length) { console.log(`\n── ${sym} — no data`); continue; }
     await processSymbol(sym, candles, true, log);
@@ -526,8 +537,13 @@ async function run() {
 
   // Process stocks (NYSE hours only)
   if (nyseOpen) {
+    const maxStockTrades = CONFIG.maxTradesPerDay - maxCryptoTrades;
+    const stockTraded = todayStockTrades(log);
     for (const sym of stockSyms) {
-      if (todayTrades(log) >= CONFIG.maxTradesPerDay) break;
+      if (stockTraded >= maxStockTrades) {
+        console.log(`  🚫 Stock limit reached (${stockTraded}/${maxStockTrades})`);
+        break;
+      }
       const candles = stockBars[sym];
       if (!candles?.length) { console.log(`\n── ${sym} — no data`); continue; }
       await processSymbol(sym, candles, false, log);
@@ -543,7 +559,7 @@ const RUN_INTERVAL_MS = 5 * 60 * 1000;
 async function loop() {
   await run().catch(async err => {
     console.error("Cycle error:", err.message);
-    await notify(`⚠️ <b>Bot error</b>\n${err.message}`).catch(() => {});
+    // Error notifications disabled - check logs
   });
   setTimeout(loop, RUN_INTERVAL_MS);
 }
