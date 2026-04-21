@@ -105,6 +105,7 @@ async function fetchCryptoBars(symbols, tf = "5Min", limit = 100) {
 }
 
 async function fetchStockBars(symbols, tf = "5Min", limit = 100) {
+  if (!symbols.length) return {};
   const q = `symbols=${encodeURIComponent(symbols.join(","))}&timeframe=${tf}&limit=${limit}&adjustment=raw&feed=iex`;
   const d = await alpacaData(`/v2/stocks/bars?${q}`);
   const r = {};
@@ -454,7 +455,7 @@ async function refreshStockWatchlist() {
     return top;
   } catch (err) {
     console.log(`[StockScan] Failed: ${err.message}`);
-    if (existsSync(STOCK_WL)) return JSON.parse(readFileSync(STOCK_WL, "utf8")).symbols;
+    if (existsSync(STOCK_WL)) return JSON.parse(readFileSync(STOCK_WL, "utf8")).symbols || [];
     return ["QQQ","NVDA","TSLA","META","AMD","AMZN","GOOGL","SPY"];
   }
 }
