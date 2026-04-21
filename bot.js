@@ -13,7 +13,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import http from "http";
-import { notify, fmtEntry, fmtExit } from "./telegram.js";
+import { notify, fmtEntry, fmtExit, fmtSummary } from "./telegram.js";
 
 http.createServer((_, res) => res.end("OK")).on("error", () => {}).listen(process.env.PORT || 3000);
 
@@ -550,10 +550,16 @@ async function maybeSendDailySummary(log) {
   lastSummaryDate = today;
 
   const todays = log.trades.filter(t => t.date === today && t.placed);
-  let equity;
-  try { equity = parseFloat((await alpaca("GET", "/v2/account")).equity); } catch {}
-
-  // No daily summary notification - only trade alerts
+  try {
+    const account   = await alpaca("GET", "/v2/account");
+    const equity    = parseFloat(account.equity);
+    const lastEquity = parseFloat(account.last_equity);
+    const wins      = todays.filter(t => t.result === "WIN").length;
+    const losses    = todays.filter(t => t.result === "LOSS").length;
+    await notify(fmtSummary({ equity, lastEquity, trades: todays.length, wins, losses, mode: isPaper ? "PAPER" : "LIVE" }));
+  } catch (err) {
+    console.log(`[Summary] Failed: ${err.message}`);
+  }
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
