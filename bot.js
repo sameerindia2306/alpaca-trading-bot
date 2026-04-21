@@ -312,9 +312,59 @@ function todayStockTrades(log) {
 
 // ─── Exit detection ───────────────────────────────────────────────────────────
 
-async function checkExits() {
+async function checkCryptoExits() {
+  // Crypto: actively monitor and close when SL/TP hit
   const stored = loadPos();
-  if (!Object.keys(stored).length) return;
+  const cryptoPositions = Object.entries(stored).filter(([_, pos]) => pos.isCrypto);
+  if (!cryptoPositions.length) return;
+
+  let livePositions;
+  try {
+    livePositions = await alpaca("GET", "/v2/positions");
+  } catch { return; }
+
+  const liveCrypto = new Set(livePositions.filter(p => p.symbol.includes("USD")).map(p => p.symbol));
+  const updated = { ...stored };
+  const cryptoBars = await fetchCryptoBars(cryptoPositions.map(([s]) => s), "1Min", 5);
+
+  for (const [sym, pos] of cryptoPositions) {
+    if (!liveCrypto.has(sym)) continue; // Already closed
+
+    const candles = cryptoBars[sym];
+    if (!candles?.length) continue;
+
+    const currentPrice = candles[candles.length - 1].close;
+    const hitSL = pos.side === "buy" ? currentPrice <= pos.sl : currentPrice >= pos.sl;
+    const hitTP = pos.side === "buy" ? currentPrice >= pos.tp : currentPrice <= pos.tp;
+
+    if (hitSL || hitTP) {
+      try {
+        // Close the position
+        await alpaca("POST", `/v2/positions/${sym}`, { side: pos.side === "buy" ? "sell" : "buy", qty: "all" });
+        const pnlUSD = pos.side === "buy"
+          ? (currentPrice - pos.entryPrice) * (pos.size / pos.entryPrice)
+          : (pos.entryPrice - currentPrice) * (pos.size / pos.entryPrice);
+        const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * (pos.side === "buy" ? 100 : -100);
+        const result = pnlUSD > 0.01 ? "WIN" : pnlUSD < -0.01 ? "LOSS" : "BREAKEVEN";
+        const exitType = hitSL ? "SL" : "TP";
+
+        await notify(fmtExit({ symbol: sym, side: pos.side, entryPrice: pos.entryPrice, exitPrice: currentPrice, pnlUSD, pnlPct, result, held: "live" }));
+        console.log(`  ${result === "WIN" ? "✅" : "❌"} ${sym} closed via ${exitType} | P&L: $${pnlUSD.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
+        delete updated[sym];
+      } catch (err) {
+        console.log(`  ⚠️  Failed to close ${sym}: ${err.message}`);
+      }
+    }
+  }
+
+  savePos(updated);
+}
+
+async function checkStockExits() {
+  // Stocks: bracket orders auto-close, just detect and log
+  const stored = loadPos();
+  const stockPositions = Object.entries(stored).filter(([_, pos]) => !pos.isCrypto);
+  if (!stockPositions.length) return;
 
   let alpacaPositions;
   try {
@@ -324,7 +374,7 @@ async function checkExits() {
   const live = new Set(alpacaPositions.map(p => p.symbol));
   const updated = { ...stored };
 
-  for (const [sym, pos] of Object.entries(stored)) {
+  for (const [sym, pos] of stockPositions) {
     if (live.has(sym)) continue;
 
     // Position closed — fetch actual exit from Alpaca orders
@@ -360,6 +410,11 @@ async function checkExits() {
   }
 
   savePos(updated);
+}
+
+async function checkExits() {
+  await checkCryptoExits();
+  await checkStockExits();
 }
 
 // ─── Watchlist scanners ───────────────────────────────────────────────────────
@@ -405,16 +460,28 @@ async function refreshStockWatchlist() {
 // ─── Order placement ──────────────────────────────────────────────────────────
 
 async function placeOrder(symbol, side, size, price, sl, tp, isCrypto) {
-  return alpaca("POST", "/v2/orders", {
-    symbol,
-    notional:       size.toFixed(2),
-    side,
-    type:           "market",
-    time_in_force:  isCrypto ? "gtc" : "day",
-    order_class:    "bracket",
-    stop_loss:      { stop_price:  String(sl) },
-    take_profit:    { limit_price: String(tp) },
-  });
+  // Crypto doesn't support bracket orders - use simple market order
+  // Stocks use bracket orders with SL/TP
+  if (isCrypto) {
+    return alpaca("POST", "/v2/orders", {
+      symbol,
+      notional:      size.toFixed(2),
+      side,
+      type:          "market",
+      time_in_force: "gtc",
+    });
+  } else {
+    return alpaca("POST", "/v2/orders", {
+      symbol,
+      notional:       size.toFixed(2),
+      side,
+      type:           "market",
+      time_in_force:  "day",
+      order_class:    "bracket",
+      stop_loss:      { stop_price:  String(sl) },
+      take_profit:    { limit_price: String(tp) },
+    });
+  }
 }
 
 // ─── Per-symbol processing ────────────────────────────────────────────────────
@@ -430,7 +497,15 @@ async function processSymbol(symbol, candles, isCrypto, log) {
   const p          = isCrypto ? PARAMS.crypto : PARAMS.stock;
   const { pass, score, side, price, atr } = runStrategy(candles, trendBias, p, isCrypto);
 
-  if (!pass || !side || !atr) { console.log(`  🚫 BLOCKED`); return; }
+  if (!pass || !side || !atr) {
+    console.log(`  🚫 BLOCKED`);
+    // Send blocked notification (only if at least 1 bonus condition passed - shows we're close)
+    if (score >= 1) {
+      const reason = !pass ? "filters" : !side ? "no direction" : "no ATR";
+      await notify(`🚫 <b>${symbol}</b> blocked - ${reason}\nRSI: ${score > 0 ? "✅" : "❌"} | Bias: ${trendBias || "❌"} | VWAP: ${score >= 2 ? "✅" : "❌"}`);
+    }
+    return;
+  }
 
   const confidence = confidenceLabel(score);
   const size       = calcSize(score);
@@ -491,8 +566,6 @@ async function run() {
   console.log(`\n${"═".repeat(56)}`);
   console.log(`  Alpaca Trading Bot — ${isPaper ? "📋 PAPER" : "🔴 LIVE"}`);
   console.log(`  ${ts}`);
-  console.log(`  Telegram token: ${process.env.TELEGRAM_BOT_TOKEN ? "SET" : "MISSING"}`);
-  console.log(`  Telegram chat:  ${process.env.TELEGRAM_CHAT_ID   ? "SET" : "MISSING"}`);
   console.log(`${"═".repeat(56)}`);
 
   // Load trade log
