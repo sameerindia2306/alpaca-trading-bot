@@ -49,7 +49,9 @@ async function alpaca(method, path, body) {
     method, headers: AUTH, body: body ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return null;
-  const json = await res.json();
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`Alpaca ${method} ${path}: ${res.status} — ${text}`); }
   if (!res.ok) throw new Error(`Alpaca ${method} ${path}: ${json.message || res.status}`);
   return json;
 }
@@ -340,7 +342,7 @@ async function checkCryptoExits() {
     if (hitSL || hitTP) {
       try {
         // Close the position
-        await alpaca("POST", `/v2/positions/${sym}`, { side: pos.side === "buy" ? "sell" : "buy", qty: "all" });
+        await alpaca("DELETE", `/v2/positions/${sym}`);
         const pnlUSD = pos.side === "buy"
           ? (currentPrice - pos.entryPrice) * (pos.size / pos.entryPrice)
           : (pos.entryPrice - currentPrice) * (pos.size / pos.entryPrice);
