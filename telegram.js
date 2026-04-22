@@ -21,9 +21,10 @@ export async function notify(text) {
 }
 
 export function fmtEntry({ symbol, side, price, size, sl, tp, confidence, mode }) {
-  const emoji = side === "buy" ? "🟢" : "🔴";
+  const emoji     = side === "buy" ? "🟢" : "🔴";
+  const direction = side === "buy" ? "LONG" : "SHORT";
   return [
-    `${emoji} <b>${side.toUpperCase()} ${symbol}</b>${mode === "PAPER" ? " [PAPER]" : ""}`,
+    `${emoji} <b>${side.toUpperCase()} ${symbol} — ${direction}</b>${mode === "PAPER" ? " [PAPER]" : ""}`,
     `Entry: $${price.toFixed(4)} | Size: $${size.toFixed(2)}`,
     `SL: $${sl.toFixed(4)} | TP: $${tp.toFixed(4)}`,
   ].join("\n");
